@@ -1,0 +1,8 @@
+pandas
+numpy
+yfinance
+requests
+python-dotenv
+jinja2
+matplotlib
+streamlit
