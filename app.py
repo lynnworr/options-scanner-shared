@@ -51,6 +51,12 @@ def safe_float(value, default=np.nan):
         return default
 
 
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
 def run_script(script_name: str):
     script_path = BASE_DIR / "src" / script_name
 
@@ -85,6 +91,27 @@ def load_options_board():
     if df.empty:
         return df
 
+    # Normalize text columns so filters do not fail from hidden spaces.
+    text_cols = [
+        "Ticker",
+        "Bias",
+        "SetupType",
+        "Strategy",
+        "Expiration",
+        "BuyLeg",
+        "SellLeg",
+        "DebitOrCredit",
+        "QualityFlag",
+        "ActionGrade",
+        "RobinhoodChainUrl",
+        "VerifyRule",
+        "RobinhoodAction",
+    ]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
     numeric_cols = [
         "StockPrice",
         "NetDebitCredit",
@@ -101,6 +128,15 @@ def load_options_board():
         "SellStrike",
         "DTE",
         "ActionRank",
+        "BuyDelta",
+        "SellDelta",
+        "BuyIV",
+        "SellIV",
+        "BuyOI",
+        "SellOI",
+        "BuyVolume",
+        "SellVolume",
+        "AvgBidAskSpreadPct",
     ]
 
     for col in numeric_cols:
@@ -117,21 +153,23 @@ def load_diagnostics():
 
     df = pd.read_csv(DIAGNOSTICS_PATH)
 
+    text_cols = ["Ticker", "Expiration", "Status"]
+
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
     return df
 
 
 def manual_verify_priority(row: pd.Series):
-    """
-    Ranks which scanner ideas are worth checking manually in Robinhood first.
-    This is not a trade signal. It only tells you which ideas deserve attention first.
-    """
     final_score = safe_float(row.get("FinalScore", 0), 0)
     stock_score = safe_float(row.get("StockSetupScore", 0), 0)
-    reward_risk = safe_float(row.get("RewardRisk", 0), 0)
+    reward_risk = safe_float(row.get("RewardRisk", np.nan), np.nan)
     dte = safe_float(row.get("DTE", 0), 0)
 
-    quality = str(row.get("QualityFlag", ""))
-    strategy = str(row.get("Strategy", ""))
+    quality = clean_text(row.get("QualityFlag", ""))
+    strategy = clean_text(row.get("Strategy", ""))
 
     priority_score = 0
     reasons = []
@@ -163,27 +201,31 @@ def manual_verify_priority(row: pd.Series):
         priority_score += 1
         reasons.append("near-term fallback DTE")
 
-    if "Credit" in strategy:
-        if 0.50 <= reward_risk <= 2.00:
-            priority_score += 3
-            reasons.append("strong credit spread reward/risk")
-        elif 0.30 <= reward_risk < 0.50:
-            priority_score += 2
-            reasons.append("reasonable credit spread reward/risk")
-        elif 0.20 <= reward_risk < 0.30:
-            priority_score += 1
-            reasons.append("thin but possible credit spread reward/risk")
-
+    if strategy in ["Long Call", "Long Put"]:
+        priority_score += 2
+        reasons.append("simple long option")
+    elif "Credit" in strategy:
+        if not pd.isna(reward_risk):
+            if 0.50 <= reward_risk <= 2.00:
+                priority_score += 3
+                reasons.append("strong credit spread reward/risk")
+            elif 0.30 <= reward_risk < 0.50:
+                priority_score += 2
+                reasons.append("reasonable credit spread reward/risk")
+            elif 0.20 <= reward_risk < 0.30:
+                priority_score += 1
+                reasons.append("thin but possible credit spread reward/risk")
     elif "Debit" in strategy:
-        if reward_risk >= 1.00:
-            priority_score += 3
-            reasons.append("strong debit spread reward/risk")
-        elif reward_risk >= 0.75:
-            priority_score += 2
-            reasons.append("reasonable debit spread reward/risk")
-        elif reward_risk >= 0.50:
-            priority_score += 1
-            reasons.append("thin but possible debit spread reward/risk")
+        if not pd.isna(reward_risk):
+            if reward_risk >= 1.00:
+                priority_score += 3
+                reasons.append("strong debit spread reward/risk")
+            elif reward_risk >= 0.75:
+                priority_score += 2
+                reasons.append("reasonable debit spread reward/risk")
+            elif reward_risk >= 0.50:
+                priority_score += 1
+                reasons.append("thin but possible debit spread reward/risk")
 
     if "Good liquidity" in quality:
         priority_score += 2
@@ -248,6 +290,11 @@ def score_label(score):
     return "Low quality"
 
 
+def is_long_option_strategy(series: pd.Series):
+    strategy_clean = series.fillna("").astype(str).str.strip()
+    return strategy_clean.isin(["Long Call", "Long Put"])
+
+
 # ============================================================
 # Header
 # ============================================================
@@ -292,6 +339,7 @@ if st.sidebar.button("Run Full Scan", use_container_width=True):
             st.sidebar.success("Full scan complete.")
 
     st.session_state["scan_log"] = full_log
+    st.rerun()
 
 if st.sidebar.button("Refresh Board", use_container_width=True):
     st.cache_data.clear()
@@ -317,12 +365,25 @@ if df.empty:
 
 df = add_manual_priority_columns(df)
 
+if "Strategy" in df.columns:
+    df["Strategy"] = df["Strategy"].fillna("").astype(str).str.strip()
+
 
 # ============================================================
 # Filters
 # ============================================================
 
 st.sidebar.header("Filters")
+
+strategy_group = st.sidebar.radio(
+    "Strategy Group",
+    [
+        "All Strategies",
+        "Long Options Only",
+        "Spreads Only",
+    ],
+    index=0,
+)
 
 tickers = sorted(df["Ticker"].dropna().unique().tolist()) if "Ticker" in df.columns else []
 strategies = sorted(df["Strategy"].dropna().unique().tolist()) if "Strategy" in df.columns else []
@@ -334,11 +395,7 @@ grades = sorted(df["ActionGrade"].dropna().unique().tolist()) if "ActionGrade" i
 selected_tickers = st.sidebar.multiselect("Tickers", tickers)
 selected_strategies = st.sidebar.multiselect("Strategies", strategies)
 selected_biases = st.sidebar.multiselect("Bias", biases)
-selected_priorities = st.sidebar.multiselect(
-    "Manual Verify Priority",
-    priorities,
-    default=[p for p in ["VERIFY FIRST", "VERIFY"] if p in priorities],
-)
+selected_priorities = st.sidebar.multiselect("Manual Verify Priority", priorities)
 selected_qualities = st.sidebar.multiselect("Quote Quality", qualities)
 selected_grades = st.sidebar.multiselect("Action Grade", grades)
 
@@ -350,7 +407,7 @@ min_score = st.sidebar.slider(
     step=1.0,
 )
 
-max_dte_default = 7
+max_dte_default = 14
 if "DTE" in df.columns and not df["DTE"].dropna().empty:
     max_dte_default = int(min(max(df["DTE"].dropna()), 14))
 
@@ -371,6 +428,15 @@ min_reward_risk = st.sidebar.slider(
 )
 
 filtered = df.copy()
+
+if "Strategy" in filtered.columns:
+    strategy_clean = filtered["Strategy"].fillna("").astype(str).str.strip()
+
+    if strategy_group == "Long Options Only":
+        filtered = filtered[strategy_clean.isin(["Long Call", "Long Put"])]
+
+    elif strategy_group == "Spreads Only":
+        filtered = filtered[~strategy_clean.isin(["Long Call", "Long Put"])]
 
 if selected_tickers:
     filtered = filtered[filtered["Ticker"].isin(selected_tickers)]
@@ -396,8 +462,19 @@ if "FinalScore" in filtered.columns:
 if "DTE" in filtered.columns:
     filtered = filtered[filtered["DTE"] <= max_dte]
 
-if "RewardRisk" in filtered.columns:
-    filtered = filtered[filtered["RewardRisk"] >= min_reward_risk]
+if "RewardRisk" in filtered.columns and "Strategy" in filtered.columns:
+    long_mask = is_long_option_strategy(filtered["Strategy"])
+
+    reward_risk_numeric = pd.to_numeric(
+        filtered["RewardRisk"],
+        errors="coerce",
+    )
+
+    filtered = filtered[
+        long_mask
+        | reward_risk_numeric.isna()
+        | (reward_risk_numeric >= min_reward_risk)
+    ]
 
 if not filtered.empty:
     filtered = filtered.sort_values(
@@ -406,9 +483,8 @@ if not filtered.empty:
             "DTE",
             "FinalScore",
             "StockSetupScore",
-            "RewardRisk",
         ],
-        ascending=[False, True, False, False, False],
+        ascending=[False, True, False, False],
     )
 
 
@@ -416,7 +492,7 @@ if not filtered.empty:
 # Metrics
 # ============================================================
 
-m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 
 with m1:
     st.metric("Trades", len(filtered))
@@ -425,18 +501,32 @@ with m2:
     st.metric("Tickers", filtered["Ticker"].nunique() if not filtered.empty else 0)
 
 with m3:
+    if not filtered.empty and "Strategy" in filtered.columns:
+        strategy_clean = filtered["Strategy"].fillna("").astype(str).str.strip()
+        long_call_count = int((strategy_clean == "Long Call").sum())
+    else:
+        long_call_count = 0
+
+    st.metric("Long Calls", long_call_count)
+
+with m4:
+    if not filtered.empty and "Strategy" in filtered.columns:
+        strategy_clean = filtered["Strategy"].fillna("").astype(str).str.strip()
+        long_put_count = int((strategy_clean == "Long Put").sum())
+    else:
+        long_put_count = 0
+
+    st.metric("Long Puts", long_put_count)
+
+with m5:
     verify_first_count = int((filtered["ManualVerifyPriority"] == "VERIFY FIRST").sum()) if not filtered.empty else 0
     st.metric("Verify First", verify_first_count)
 
-with m4:
-    verify_count = int((filtered["ManualVerifyPriority"] == "VERIFY").sum()) if not filtered.empty else 0
-    st.metric("Verify", verify_count)
-
-with m5:
+with m6:
     short_dte_count = int((filtered["DTE"] <= 7).sum()) if "DTE" in filtered.columns and not filtered.empty else 0
     st.metric("≤ 7 DTE", short_dte_count)
 
-with m6:
+with m7:
     top_score = filtered["FinalScore"].max() if "FinalScore" in filtered.columns and not filtered.empty else 0
     st.metric("Top Score", f"{top_score:.1f}")
 
@@ -520,7 +610,7 @@ else:
         + " | "
         + detail_df["BuyLeg"].astype(str)
         + " / "
-        + detail_df["SellLeg"].astype(str)
+        + detail_df["SellLeg"].fillna("").astype(str)
     )
 
     selected_label = st.selectbox(
@@ -548,11 +638,30 @@ else:
         st.write(f"**Type:** {selected.get('DebitOrCredit', '')}")
         st.write(f"**Scanner Credit/Debit:** ${safe_float(selected.get('NetDebitCredit', 0), 0):.2f}")
         st.write(f"**Minimum Robinhood Price:** ${safe_float(selected.get('MinimumRobinhoodPrice', 0), 0):.2f}")
-        st.write(f"**Width:** ${safe_float(selected.get('SpreadWidth', 0), 0):.2f}")
-        st.write(f"**Max Profit:** ${safe_float(selected.get('MaxProfit', 0), 0):.2f}")
+
+        spread_width = safe_float(selected.get("SpreadWidth", np.nan), np.nan)
+
+        if not pd.isna(spread_width):
+            st.write(f"**Width:** ${spread_width:.2f}")
+        else:
+            st.write("**Width:** N/A")
+
+        max_profit = safe_float(selected.get("MaxProfit", np.nan), np.nan)
+
+        if not pd.isna(max_profit):
+            st.write(f"**Max Profit:** ${max_profit:.2f}")
+        else:
+            st.write("**Max Profit:** Unlimited / not capped")
+
         st.write(f"**Max Loss:** ${safe_float(selected.get('MaxLoss', 0), 0):.2f}")
         st.write(f"**Breakeven:** ${safe_float(selected.get('Breakeven', 0), 0):.2f}")
-        st.write(f"**Reward/Risk:** {safe_float(selected.get('RewardRisk', 0), 0):.2f}")
+
+        reward_risk = safe_float(selected.get("RewardRisk", np.nan), np.nan)
+
+        if not pd.isna(reward_risk):
+            st.write(f"**Reward/Risk:** {reward_risk:.2f}")
+        else:
+            st.write("**Reward/Risk:** N/A for long option")
 
     with c3:
         st.markdown("### Priority / Score")
@@ -573,8 +682,8 @@ else:
 
     st.markdown("### How to verify in Robinhood")
     st.write(
-        "Open the chain, choose the same expiration, use Builder, add the exact buy and sell legs, "
-        "then compare Robinhood's credit/debit, max profit, max loss, and breakeven to the scanner estimate."
+        "Open the chain, choose the same expiration, use Builder if needed, add the exact option leg or spread legs, "
+        "then compare Robinhood's credit/debit, max profit, max loss, breakeven, and liquidity to the scanner estimate."
     )
 
     st.markdown("### Score guide")

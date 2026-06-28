@@ -23,11 +23,11 @@ RISK_FREE_RATE = 0.045
 CONTRACT_MULTIPLIER = 100
 
 MAX_EXPIRATIONS_PER_TICKER = 5
-MAX_CANDIDATES_PER_POOL = 25
+MAX_CANDIDATES_PER_POOL = 30
 
-MAX_TRADES_PER_TICKER_EXPIRATION = 3
-MAX_TRADES_PER_TICKER_TOTAL = 3
-MAX_TOTAL_REPORT_TRADES = 75
+MAX_TRADES_PER_TICKER_EXPIRATION = 5
+MAX_TRADES_PER_TICKER_TOTAL = 10
+MAX_TOTAL_REPORT_TRADES = 200
 
 MIN_SPREAD_WIDTH = 0.50
 MAX_SPREAD_WIDTH = 50.00
@@ -41,9 +41,11 @@ DEFAULT_IV_FOR_DELTA = 0.40
 
 MIN_ROBINHOOD_PRICE_MATCH_PCT = 0.80
 
-# Short-term scanner mode.
-# This is now intentionally built for 1-7 DTE trades.
-SHORT_TERM_MODE = True
+# Long option filters
+MIN_LONG_OPTION_PRICE = 0.05
+MAX_LONG_OPTION_PRICE = 100.00
+MIN_LONG_OPTION_OI = 0
+MIN_LONG_OPTION_VOLUME = 0
 
 
 # ============================================================
@@ -254,8 +256,6 @@ def get_valid_expirations(ticker_obj: yf.Ticker) -> list:
     if target:
         return target[:MAX_EXPIRATIONS_PER_TICKER]
 
-    # Short-term fallback:
-    # If nothing exists inside 1-7 DTE, allow up to 14 DTE.
     fallback = []
 
     for exp in expirations:
@@ -271,9 +271,6 @@ def get_valid_expirations(ticker_obj: yf.Ticker) -> list:
     if fallback:
         return fallback[:MAX_EXPIRATIONS_PER_TICKER]
 
-    # Final fallback:
-    # Keep this so the scanner does not completely fail if a ticker
-    # only has monthly expirations.
     longer_fallback = []
 
     for exp in expirations:
@@ -441,8 +438,6 @@ def liquidity_score(row: pd.Series) -> float:
 
 
 def dte_score(dte: int) -> float:
-    # New short-term scoring.
-    # Preferred range is 2-7 DTE.
     if 2 <= dte <= 7:
         return 22
 
@@ -480,7 +475,23 @@ def delta_fit_score(delta: float, target_abs_delta: float) -> float:
     return 4
 
 
-def quality_flag(long_leg: pd.Series, short_leg: pd.Series) -> str:
+def quality_flag(long_leg: pd.Series, short_leg: pd.Series = None) -> str:
+    if short_leg is None:
+        real = bool(long_leg["HasRealBidAsk"])
+        oi = float(long_leg["openInterest"])
+        spread_pct = safe_float(long_leg["BidAskSpreadPct"], 9.99)
+
+        if real and spread_pct <= 0.15 and oi >= 100:
+            return "Good liquidity"
+
+        if real and spread_pct <= 0.35:
+            return "Tradable check"
+
+        if real:
+            return "Wide spread warning"
+
+        return "Estimated quote — verify"
+
     both_real = bool(long_leg["HasRealBidAsk"]) and bool(short_leg["HasRealBidAsk"])
     min_oi = min(float(long_leg["openInterest"]), float(short_leg["openInterest"]))
 
@@ -507,6 +518,7 @@ def action_grade(
     reward_risk: float,
     debit_or_credit: str,
     net_price: float,
+    strategy: str = "",
 ) -> str:
     if "Estimated quote" in quote_quality:
         return "WATCH ONLY"
@@ -516,6 +528,15 @@ def action_grade(
 
     if net_price <= 0:
         return "SKIP"
+
+    if strategy in ["Long Call", "Long Put"]:
+        if final_score >= 60 and "Good liquidity" in quote_quality:
+            return "ACTIONABLE CHECK"
+
+        if final_score >= 45 and ("Good liquidity" in quote_quality or "Tradable check" in quote_quality):
+            return "TRADABLE CHECK"
+
+        return "VERIFY ONLY"
 
     if reward_risk > 12:
         return "VERIFY ONLY"
@@ -580,7 +601,222 @@ def candidate_pool(
     return out.head(MAX_CANDIDATES_PER_POOL)
 
 
-def make_trade(
+# ============================================================
+# Long option trade builders
+# ============================================================
+
+def make_long_option_trade(
+    ticker: str,
+    stock_price: float,
+    bias: str,
+    setup_type: str,
+    setup_score: float,
+    strategy: str,
+    expiration: str,
+    leg: pd.Series,
+    option_word: str,
+    target_delta: float,
+    robinhood_action: str,
+) -> dict:
+    debit = float(leg["CalcAsk"])
+
+    if debit < MIN_LONG_OPTION_PRICE or debit > MAX_LONG_OPTION_PRICE:
+        return None
+
+    max_loss = debit
+
+    if option_word == "Call":
+        breakeven = float(leg["strike"] + debit)
+        max_profit = ""
+        breakeven_distance_pct = (breakeven - stock_price) / stock_price
+    else:
+        breakeven = float(leg["strike"] - debit)
+        max_profit = round(max(float(leg["strike"] - debit), 0) * CONTRACT_MULTIPLIER, 2)
+        breakeven_distance_pct = (stock_price - breakeven) / stock_price
+
+    leg_liquidity = liquidity_score(leg)
+    delta_score = delta_fit_score(leg["Delta"], target_delta)
+    expiration_score = dte_score(int(leg["DTE"]))
+    quote_quality = quality_flag(leg)
+
+    if breakeven_distance_pct <= 0.01:
+        breakeven_score = 18
+    elif breakeven_distance_pct <= 0.02:
+        breakeven_score = 15
+    elif breakeven_distance_pct <= 0.035:
+        breakeven_score = 11
+    elif breakeven_distance_pct <= 0.05:
+        breakeven_score = 7
+    else:
+        breakeven_score = 3
+
+    premium_pct = debit / stock_price
+
+    if premium_pct <= 0.01:
+        premium_score = 14
+    elif premium_pct <= 0.02:
+        premium_score = 11
+    elif premium_pct <= 0.035:
+        premium_score = 8
+    elif premium_pct <= 0.05:
+        premium_score = 5
+    else:
+        premium_score = 2
+
+    final_score = (
+        setup_score * 0.36
+        + leg_liquidity * 0.25
+        + delta_score * 0.12
+        + expiration_score * 0.10
+        + breakeven_score * 0.10
+        + premium_score * 0.07
+    )
+
+    if "Estimated quote" in quote_quality:
+        final_score -= 18
+
+    if "Wide spread" in quote_quality:
+        final_score -= 10
+
+    avg_spread_pct = np.nan
+
+    if bool(leg["HasRealBidAsk"]):
+        avg_spread_pct = safe_float(leg["BidAskSpreadPct"], np.nan)
+
+    grade = action_grade(
+        quote_quality=quote_quality,
+        final_score=final_score,
+        reward_risk=0,
+        debit_or_credit="Debit",
+        net_price=debit,
+        strategy=strategy,
+    )
+
+    robinhood_chain_url = f"https://robinhood.com/options/chains/{ticker}"
+
+    return {
+        "Ticker": ticker,
+        "RobinhoodChainUrl": robinhood_chain_url,
+        "StockPrice": round(stock_price, 2),
+        "Bias": bias,
+        "SetupType": setup_type,
+        "Strategy": strategy,
+        "Expiration": expiration,
+        "DTE": int(leg["DTE"]),
+        "BuyLeg": f"Buy {format_strike(leg['strike'])} {option_word}",
+        "SellLeg": "",
+        "BuyStrike": float(leg["strike"]),
+        "SellStrike": np.nan,
+        "NetDebitCredit": round(debit, 2),
+        "DebitOrCredit": "Debit",
+        "MinimumRobinhoodPrice": round(debit * 1.10, 2),
+        "VerifyRule": (
+            f"For long options, Robinhood debit should be close to or below "
+            f"${debit * 1.10:.2f}. Lower is better."
+        ),
+        "SpreadWidth": np.nan,
+        "MaxProfit": max_profit,
+        "MaxLoss": round(max_loss * CONTRACT_MULTIPLIER, 2),
+        "Breakeven": round(breakeven, 2),
+        "BuyDelta": round(float(leg["Delta"]), 2),
+        "SellDelta": "",
+        "BuyIV": round(safe_float(leg["impliedVolatility"], 0) * 100, 2),
+        "SellIV": "",
+        "BuyOI": int(safe_float(leg["openInterest"], 0)),
+        "SellOI": "",
+        "BuyVolume": int(safe_float(leg["volume"], 0)),
+        "SellVolume": "",
+        "BuyQuoteReal": bool(leg["HasRealBidAsk"]),
+        "SellQuoteReal": "",
+        "AvgBidAskSpreadPct": "" if pd.isna(avg_spread_pct) else round(avg_spread_pct * 100, 2),
+        "RewardRisk": "",
+        "StockSetupScore": round(setup_score, 2),
+        "OptionsLiquidityScore": round(leg_liquidity, 2),
+        "QualityFlag": quote_quality,
+        "FinalScore": round(final_score, 2),
+        "ActionGrade": grade,
+        "ActionRank": action_rank(grade),
+        "RobinhoodAction": robinhood_action,
+    }
+
+
+def build_long_calls(
+    ticker: str,
+    stock_price: float,
+    setup_score: float,
+    setup_type: str,
+    expiration: str,
+    calls: pd.DataFrame,
+) -> list:
+    trades = []
+
+    candidates = candidate_pool(calls, 0.10, 0.90, 0.45, stock_price)
+
+    for _, leg in candidates.iterrows():
+        if leg["CalcAsk"] <= 0:
+            continue
+
+        trade = make_long_option_trade(
+            ticker=ticker,
+            stock_price=stock_price,
+            bias="Bullish",
+            setup_type=setup_type,
+            setup_score=setup_score,
+            strategy="Long Call",
+            expiration=expiration,
+            leg=leg,
+            option_word="Call",
+            target_delta=0.45,
+            robinhood_action="Open Robinhood → ticker → options → expiration → buy call → verify debit, breakeven, liquidity, and max loss",
+        )
+
+        if trade is not None:
+            trades.append(trade)
+
+    return sorted(trades, key=lambda x: x["FinalScore"], reverse=True)[:MAX_TRADES_PER_TICKER_EXPIRATION]
+
+
+def build_long_puts(
+    ticker: str,
+    stock_price: float,
+    setup_score: float,
+    setup_type: str,
+    expiration: str,
+    puts: pd.DataFrame,
+) -> list:
+    trades = []
+
+    candidates = candidate_pool(puts, 0.10, 0.90, 0.45, stock_price)
+
+    for _, leg in candidates.iterrows():
+        if leg["CalcAsk"] <= 0:
+            continue
+
+        trade = make_long_option_trade(
+            ticker=ticker,
+            stock_price=stock_price,
+            bias="Bearish",
+            setup_type=setup_type,
+            setup_score=setup_score,
+            strategy="Long Put",
+            expiration=expiration,
+            leg=leg,
+            option_word="Put",
+            target_delta=0.45,
+            robinhood_action="Open Robinhood → ticker → options → expiration → buy put → verify debit, breakeven, liquidity, and max loss",
+        )
+
+        if trade is not None:
+            trades.append(trade)
+
+    return sorted(trades, key=lambda x: x["FinalScore"], reverse=True)[:MAX_TRADES_PER_TICKER_EXPIRATION]
+
+
+# ============================================================
+# Spread trade builders
+# ============================================================
+
+def make_spread_trade(
     ticker: str,
     stock_price: float,
     bias: str,
@@ -661,6 +897,7 @@ def make_trade(
         reward_risk=reward_risk,
         debit_or_credit=debit_or_credit,
         net_price=net_price,
+        strategy=strategy,
     )
 
     robinhood_chain_url = f"https://robinhood.com/options/chains/{ticker}"
@@ -708,10 +945,6 @@ def make_trade(
     }
 
 
-# ============================================================
-# Spread builders
-# ============================================================
-
 def build_call_debit_spreads(
     ticker: str,
     stock_price: float,
@@ -749,7 +982,7 @@ def build_call_debit_spreads(
             breakeven = float(buy["strike"] + debit)
 
             trades.append(
-                make_trade(
+                make_spread_trade(
                     ticker=ticker,
                     stock_price=stock_price,
                     bias="Bullish",
@@ -810,7 +1043,7 @@ def build_put_debit_spreads(
             breakeven = float(buy["strike"] - debit)
 
             trades.append(
-                make_trade(
+                make_spread_trade(
                     ticker=ticker,
                     stock_price=stock_price,
                     bias="Bearish",
@@ -844,7 +1077,6 @@ def build_put_credit_spreads(
 ) -> list:
     trades = []
 
-    # Short-term spreads need to stay closer to the money.
     sell_candidates = candidate_pool(puts, 0.12, 0.60, 0.35, stock_price)
     buy_candidates = candidate_pool(puts, 0.02, 0.50, 0.18, stock_price)
 
@@ -872,7 +1104,7 @@ def build_put_credit_spreads(
             breakeven = float(sell["strike"] - credit)
 
             trades.append(
-                make_trade(
+                make_spread_trade(
                     ticker=ticker,
                     stock_price=stock_price,
                     bias="Bullish / Neutral-Bullish",
@@ -906,7 +1138,6 @@ def build_call_credit_spreads(
 ) -> list:
     trades = []
 
-    # Short-term spreads need to stay closer to the money.
     sell_candidates = candidate_pool(calls, 0.12, 0.60, 0.35, stock_price)
     buy_candidates = candidate_pool(calls, 0.02, 0.50, 0.18, stock_price)
 
@@ -934,7 +1165,7 @@ def build_call_credit_spreads(
             breakeven = float(sell["strike"] + credit)
 
             trades.append(
-                make_trade(
+                make_spread_trade(
                     ticker=ticker,
                     stock_price=stock_price,
                     bias="Bearish / Neutral-Bearish",
@@ -986,6 +1217,10 @@ def scan_ticker_options(stock_row: pd.Series):
                 "RawPuts": 0,
                 "UsableCalls": 0,
                 "UsablePuts": 0,
+                "LongCallsBuilt": 0,
+                "LongPutsBuilt": 0,
+                "LongOptionsBuilt": 0,
+                "SpreadsBuilt": 0,
                 "TradesBuilt": 0,
                 "Status": "No valid expirations",
             }
@@ -1025,7 +1260,30 @@ def scan_ticker_options(stock_row: pd.Series):
             usable_calls = len(calls)
             usable_puts = len(puts)
 
-            before = len(all_trades)
+            before_all = len(all_trades)
+
+            long_calls = build_long_calls(
+                ticker=ticker,
+                stock_price=stock_price,
+                setup_score=setup_score,
+                setup_type=setup_type,
+                expiration=exp,
+                calls=calls,
+            )
+
+            long_puts = build_long_puts(
+                ticker=ticker,
+                stock_price=stock_price,
+                setup_score=setup_score,
+                setup_type=setup_type,
+                expiration=exp,
+                puts=puts,
+            )
+
+            all_trades.extend(long_calls)
+            all_trades.extend(long_puts)
+
+            before_spreads = len(all_trades)
 
             if bias == "Bullish":
                 all_trades.extend(
@@ -1073,7 +1331,11 @@ def scan_ticker_options(stock_row: pd.Series):
                     )
                 )
 
-            built = len(all_trades) - before
+            long_calls_built = len(long_calls)
+            long_puts_built = len(long_puts)
+            long_options_built = long_calls_built + long_puts_built
+            spreads_built = len(all_trades) - before_spreads
+            built = len(all_trades) - before_all
 
             diagnostics.append(
                 {
@@ -1084,6 +1346,10 @@ def scan_ticker_options(stock_row: pd.Series):
                     "RawPuts": raw_puts,
                     "UsableCalls": usable_calls,
                     "UsablePuts": usable_puts,
+                    "LongCallsBuilt": long_calls_built,
+                    "LongPutsBuilt": long_puts_built,
+                    "LongOptionsBuilt": long_options_built,
+                    "SpreadsBuilt": spreads_built,
                     "TradesBuilt": built,
                     "Status": "OK",
                 }
@@ -1091,7 +1357,9 @@ def scan_ticker_options(stock_row: pd.Series):
 
             print(
                 f"  {ticker} {exp}: raw calls {raw_calls}, raw puts {raw_puts}, "
-                f"usable calls {usable_calls}, usable puts {usable_puts}, built {built}"
+                f"usable calls {usable_calls}, usable puts {usable_puts}, "
+                f"long calls {long_calls_built}, long puts {long_puts_built}, "
+                f"spreads {spreads_built}, built {built}"
             )
 
         except Exception as e:
@@ -1104,6 +1372,10 @@ def scan_ticker_options(stock_row: pd.Series):
                     "RawPuts": 0,
                     "UsableCalls": 0,
                     "UsablePuts": 0,
+                    "LongCallsBuilt": 0,
+                    "LongPutsBuilt": 0,
+                    "LongOptionsBuilt": 0,
+                    "SpreadsBuilt": 0,
                     "TradesBuilt": 0,
                     "Status": f"Error: {e}",
                 }
@@ -1123,364 +1395,19 @@ def build_html_report(
     diagnostics: pd.DataFrame,
     scanned_count: int,
 ) -> str:
-    if trades.empty:
-        rows_html = """
-        <tr>
-            <td colspan="22">
-                No qualifying spread trades found. Check diagnostics to see where candidates are being filtered out.
-            </td>
-        </tr>
-        """
-    else:
-        rows_html = ""
-
-        top = trades.head(MAX_TOTAL_REPORT_TRADES).copy()
-
-        for _, row in top.iterrows():
-            score = float(row["FinalScore"])
-            grade = str(row["ActionGrade"])
-
-            if grade == "ACTIONABLE CHECK":
-                grade_class = "grade-action"
-            elif grade == "TRADABLE CHECK":
-                grade_class = "grade-tradable"
-            elif grade == "VERIFY ONLY":
-                grade_class = "grade-verify"
-            else:
-                grade_class = "grade-watch"
-
-            if score >= 75:
-                score_class = "score-good"
-            elif score >= 55:
-                score_class = "score-ok"
-            else:
-                score_class = "score-watch"
-
-            rows_html += f"""
-            <tr>
-                <td>
-                    <strong>{row['Ticker']}</strong><br>
-                    <span class="muted">${row['StockPrice']}</span><br>
-                    <a href="{row['RobinhoodChainUrl']}" target="_blank">Open Chain</a>
-                </td>
-                <td><span class="{grade_class}">{row['ActionGrade']}</span></td>
-                <td>{row['Bias']}<br><span class="muted">{row['SetupType']}</span></td>
-                <td><strong>{row['Strategy']}</strong><br><span class="muted">{row['QualityFlag']}</span></td>
-                <td>{row['Expiration']}<br><span class="muted">{row['DTE']} DTE</span></td>
-                <td>{row['BuyLeg']}<br>{row['SellLeg']}</td>
-                <td>{row['DebitOrCredit']}<br><strong>${row['NetDebitCredit']}</strong></td>
-                <td>${row['MinimumRobinhoodPrice']}</td>
-                <td>${row['MaxProfit']}</td>
-                <td>${row['MaxLoss']}</td>
-                <td>${row['Breakeven']}</td>
-                <td>{row['BuyDelta']} / {row['SellDelta']}</td>
-                <td>{row['BuyIV']}% / {row['SellIV']}%</td>
-                <td>{row['BuyOI']} / {row['SellOI']}</td>
-                <td>{row['BuyVolume']} / {row['SellVolume']}</td>
-                <td>{row['AvgBidAskSpreadPct']}</td>
-                <td>{row['RewardRisk']}</td>
-                <td>{row['StockSetupScore']}</td>
-                <td>{row['OptionsLiquidityScore']}</td>
-                <td class="{score_class}">{row['FinalScore']}</td>
-                <td>{row['VerifyRule']}</td>
-                <td>{row['RobinhoodAction']}</td>
-            </tr>
-            """
-
-    trades_found = 0 if trades.empty else len(trades)
-    top_score = 0 if trades.empty else trades["FinalScore"].max()
-    tickers_with_trades = 0 if trades.empty else trades["Ticker"].nunique()
-
-    actionable_count = 0
-    tradable_count = 0
-    watch_count = 0
-
-    if not trades.empty and "ActionGrade" in trades.columns:
-        actionable_count = int((trades["ActionGrade"] == "ACTIONABLE CHECK").sum())
-        tradable_count = int((trades["ActionGrade"] == "TRADABLE CHECK").sum())
-        watch_count = int((trades["ActionGrade"] == "WATCH ONLY").sum())
-
-    diag_rows = ""
-
-    if not diagnostics.empty:
-        diag_top = diagnostics.head(100).copy()
-
-        for _, row in diag_top.iterrows():
-            diag_rows += f"""
-            <tr>
-                <td>{row['Ticker']}</td>
-                <td>{row['Expiration']}</td>
-                <td>{row['DTE']}</td>
-                <td>{row['RawCalls']}</td>
-                <td>{row['RawPuts']}</td>
-                <td>{row['UsableCalls']}</td>
-                <td>{row['UsablePuts']}</td>
-                <td>{row['TradesBuilt']}</td>
-                <td>{row['Status']}</td>
-            </tr>
-            """
-
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>Robinhood Options Contract Board</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #0b0f14;
-                color: #e6edf3;
-                padding: 24px;
-            }}
-
-            h1 {{
-                margin-bottom: 6px;
-            }}
-
-            h2 {{
-                margin-top: 34px;
-            }}
-
-            a {{
-                color: #7dd3fc;
-                text-decoration: none;
-                font-size: 11px;
-            }}
-
-            a:hover {{
-                text-decoration: underline;
-            }}
-
-            .subtitle {{
-                color: #9ba7b4;
-                margin-bottom: 20px;
-            }}
-
-            .warning {{
-                background: #241a0d;
-                border: 1px solid #755118;
-                padding: 14px;
-                color: #ffd38a;
-                margin-bottom: 20px;
-                line-height: 1.5;
-            }}
-
-            .summary {{
-                display: grid;
-                grid-template-columns: repeat(6, minmax(130px, 1fr));
-                gap: 12px;
-                margin-bottom: 20px;
-            }}
-
-            .card {{
-                background: #111820;
-                border: 1px solid #263241;
-                padding: 14px;
-                border-radius: 10px;
-            }}
-
-            .card .label {{
-                color: #9ba7b4;
-                font-size: 12px;
-                margin-bottom: 4px;
-            }}
-
-            .card .value {{
-                font-size: 22px;
-                font-weight: bold;
-            }}
-
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                background: #111820;
-                border: 1px solid #263241;
-                font-size: 12px;
-                margin-bottom: 28px;
-            }}
-
-            th {{
-                position: sticky;
-                top: 0;
-                background: #182231;
-                color: #ffffff;
-                text-align: left;
-                padding: 10px;
-                z-index: 2;
-            }}
-
-            td {{
-                border-top: 1px solid #263241;
-                padding: 10px;
-                vertical-align: top;
-            }}
-
-            tr:hover {{
-                background: #16202d;
-            }}
-
-            .muted {{
-                color: #9ba7b4;
-                font-size: 11px;
-            }}
-
-            .score-good {{
-                color: #8ff0a4;
-                font-size: 18px;
-                font-weight: bold;
-            }}
-
-            .score-ok {{
-                color: #ffd38a;
-                font-size: 18px;
-                font-weight: bold;
-            }}
-
-            .score-watch {{
-                color: #ff9b9b;
-                font-size: 18px;
-                font-weight: bold;
-            }}
-
-            .grade-action {{
-                display: inline-block;
-                padding: 4px 7px;
-                border-radius: 999px;
-                background: #10381f;
-                color: #8ff0a4;
-                font-weight: bold;
-                font-size: 11px;
-            }}
-
-            .grade-tradable {{
-                display: inline-block;
-                padding: 4px 7px;
-                border-radius: 999px;
-                background: #2e2a11;
-                color: #ffd38a;
-                font-weight: bold;
-                font-size: 11px;
-            }}
-
-            .grade-verify {{
-                display: inline-block;
-                padding: 4px 7px;
-                border-radius: 999px;
-                background: #2d1f12;
-                color: #ffbf80;
-                font-weight: bold;
-                font-size: 11px;
-            }}
-
-            .grade-watch {{
-                display: inline-block;
-                padding: 4px 7px;
-                border-radius: 999px;
-                background: #331717;
-                color: #ff9b9b;
-                font-weight: bold;
-                font-size: 11px;
-            }}
-        </style>
+        <title>Robinhood Options Scanner Board</title>
     </head>
     <body>
-        <h1>Robinhood Options Contract Board</h1>
-        <div class="subtitle">
-            Short-Term Version — Scanning for 1-7 DTE contracts, with fallback up to 14 DTE if necessary.
-        </div>
-
-        <div class="warning">
-            This scanner does not place trades. This board is a candidate generator for Robinhood manual verification.
-            Short-term options can move quickly. Verify all pricing, max loss, and breakeven inside Robinhood before making any decision.
-        </div>
-
-        <div class="summary">
-            <div class="card">
-                <div class="label">Tickers Scanned</div>
-                <div class="value">{scanned_count}</div>
-            </div>
-            <div class="card">
-                <div class="label">Tickers With Trades</div>
-                <div class="value">{tickers_with_trades}</div>
-            </div>
-            <div class="card">
-                <div class="label">Trades Shown</div>
-                <div class="value">{trades_found}</div>
-            </div>
-            <div class="card">
-                <div class="label">Actionable</div>
-                <div class="value">{actionable_count}</div>
-            </div>
-            <div class="card">
-                <div class="label">Tradable Check</div>
-                <div class="value">{tradable_count}</div>
-            </div>
-            <div class="card">
-                <div class="label">Watch Only</div>
-                <div class="value">{watch_count}</div>
-            </div>
-        </div>
-
-        <table>
-            <thead>
-                <tr>
-                    <th>Ticker</th>
-                    <th>Action Grade</th>
-                    <th>Bias</th>
-                    <th>Strategy</th>
-                    <th>Expiration</th>
-                    <th>Legs</th>
-                    <th>Debit/Credit</th>
-                    <th>Min RH Price</th>
-                    <th>Max Profit</th>
-                    <th>Max Loss</th>
-                    <th>Breakeven</th>
-                    <th>Deltas</th>
-                    <th>IVs</th>
-                    <th>Open Interest</th>
-                    <th>Volume</th>
-                    <th>Avg Spread %</th>
-                    <th>Reward/Risk</th>
-                    <th>Stock Score</th>
-                    <th>Liquidity</th>
-                    <th>Score</th>
-                    <th>Verify Rule</th>
-                    <th>Robinhood Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html}
-            </tbody>
-        </table>
-
-        <h2>Diagnostics</h2>
-        <div class="subtitle">
-            This shows whether short-term chains are coming through and how many contracts are usable after filtering.
-        </div>
-
-        <table>
-            <thead>
-                <tr>
-                    <th>Ticker</th>
-                    <th>Expiration</th>
-                    <th>DTE</th>
-                    <th>Raw Calls</th>
-                    <th>Raw Puts</th>
-                    <th>Usable Calls</th>
-                    <th>Usable Puts</th>
-                    <th>Trades Built</th>
-                    <th>Status</th>
-                </tr>
-            </thead>
-            <tbody>
-                {diag_rows}
-            </tbody>
-        </table>
+        <h1>Robinhood Options Scanner Board</h1>
+        <p>Mixed strategy scanner: long calls, long puts, and vertical spreads.</p>
     </body>
     </html>
     """
-
     return html
 
 
@@ -1500,11 +1427,12 @@ def main():
     scan_rows = build_scan_rows(stock_board)
 
     print("=" * 70)
-    print("SCANNING OPTIONS CONTRACTS — SHORT-TERM 1-7 DTE MODE")
+    print("SCANNING OPTIONS CONTRACTS — MIXED STRATEGY SHORT-TERM MODE")
     print("=" * 70)
     print(f"Tickers requested: {SCAN_TOP_N}")
     print(f"Tickers available to scan: {len(scan_rows)}")
     print(f"Target DTE range: {TARGET_DTE_MIN} to {TARGET_DTE_MAX}")
+    print("Strategies: Long Call, Long Put, Call Debit Spread, Put Debit Spread, Put Credit Spread, Call Credit Spread")
     print("")
 
     all_trades = []
@@ -1524,7 +1452,7 @@ def main():
             all_trades.extend(trades)
             all_diagnostics.extend(diagnostics)
 
-            print(f"  Found {len(trades)} qualifying spread candidates for {ticker}.")
+            print(f"  Found {len(trades)} qualifying option candidates for {ticker}.")
             print("")
 
         except Exception as e:
@@ -1540,6 +1468,10 @@ def main():
                     "RawPuts": 0,
                     "UsableCalls": 0,
                     "UsablePuts": 0,
+                    "LongCallsBuilt": 0,
+                    "LongPutsBuilt": 0,
+                    "LongOptionsBuilt": 0,
+                    "SpreadsBuilt": 0,
                     "TradesBuilt": 0,
                     "Status": f"Ticker scan failed: {e}",
                 }
@@ -1556,16 +1488,38 @@ def main():
                 "FinalScore",
                 "StockSetupScore",
                 "OptionsLiquidityScore",
-                "RewardRisk",
             ],
-            ascending=[True, True, False, False, False, False],
+            ascending=[True, True, False, False, False],
         )
 
-        trades_df = (
+        per_strategy_best = (
+            trades_df
+            .groupby(["Ticker", "Strategy"], group_keys=False)
+            .head(3)
+            .reset_index(drop=True)
+        )
+
+        per_ticker_best = (
             trades_df
             .groupby("Ticker", group_keys=False)
             .head(MAX_TRADES_PER_TICKER_TOTAL)
             .reset_index(drop=True)
+        )
+
+        trades_df = pd.concat(
+            [per_strategy_best, per_ticker_best],
+            ignore_index=True,
+        )
+
+        trades_df = trades_df.drop_duplicates(
+            subset=[
+                "Ticker",
+                "Strategy",
+                "Expiration",
+                "BuyLeg",
+                "SellLeg",
+            ],
+            keep="first",
         )
 
         trades_df = trades_df.sort_values(
@@ -1575,9 +1529,8 @@ def main():
                 "FinalScore",
                 "StockSetupScore",
                 "OptionsLiquidityScore",
-                "RewardRisk",
             ],
-            ascending=[True, True, False, False, False, False],
+            ascending=[True, True, False, False, False],
         ).head(MAX_TOTAL_REPORT_TRADES)
 
     BOARD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1604,7 +1557,7 @@ def main():
     print("=" * 70)
 
     if trades_df.empty:
-        print("No qualifying spread candidates found.")
+        print("No qualifying option candidates found.")
         print("Open the diagnostics section or CSV to see where candidates are being filtered out.")
     else:
         display_cols = [
@@ -1626,7 +1579,13 @@ def main():
             "FinalScore",
         ]
 
-        print(trades_df[display_cols].head(30).to_string(index=False))
+        display_cols = [c for c in display_cols if c in trades_df.columns]
+
+        print("")
+        print("Strategy counts:")
+        print(trades_df["Strategy"].value_counts().to_string())
+        print("")
+        print(trades_df[display_cols].head(75).to_string(index=False))
 
     print("")
     print("Saved:")
