@@ -87,12 +87,16 @@ def load_options_board():
     if not OPTIONS_BOARD_PATH.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(OPTIONS_BOARD_PATH)
+    try:
+        df = pd.read_csv(OPTIONS_BOARD_PATH)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
     if df.empty:
         return df
 
-    # Normalize text columns so filters do not fail from hidden spaces.
     text_cols = [
         "Ticker",
         "Bias",
@@ -171,7 +175,12 @@ def load_diagnostics():
     if not DIAGNOSTICS_PATH.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(DIAGNOSTICS_PATH)
+    try:
+        df = pd.read_csv(DIAGNOSTICS_PATH)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
     text_cols = ["Ticker", "Expiration", "Status"]
 
@@ -411,9 +420,27 @@ df = load_options_board()
 
 if df.empty:
     st.info(
-        "No options board found yet. Click **Run Full Scan** in the sidebar, "
-        "or run `python src\\options_contract_scanner.py` in your terminal."
+        "No options board data found yet. Click **Run Full Scan** in the sidebar, "
+        "or run the scanner locally and push the generated board CSV to GitHub."
     )
+
+    with st.expander("How to refresh locally and push"):
+        st.code(
+            """
+cd C:\\Users\\newbl\\options-scanner-shared
+.\\.venv\\Scripts\\Activate.ps1
+
+python src\\fetch_stock_data.py
+python src\\stock_setup_scanner.py
+python src\\options_contract_scanner.py
+
+git add .
+git commit -m "Refresh options board data"
+git push
+""".strip(),
+            language="powershell",
+        )
+
     st.stop()
 
 df = add_manual_priority_columns(df)
