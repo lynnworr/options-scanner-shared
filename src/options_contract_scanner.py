@@ -11,6 +11,11 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 from config import BOARD_DIR, REPORT_DIR, TARGET_DTE_MIN, TARGET_DTE_MAX
 from ticker_universe import LIQUID_OPTIONS_UNIVERSE
+from option_greeks import (
+    estimate_leg_greeks,
+    combine_leg_greeks,
+    grade_greek_risk,
+)
 
 
 # ============================================================
@@ -562,6 +567,106 @@ def action_rank(grade: str) -> int:
     return 5
 
 
+def calculate_trade_greeks(
+    strategy: str,
+    stock_price: float,
+    dte: int,
+    breakeven: float,
+    net_debit_credit: float,
+    buy_leg: pd.Series,
+    sell_leg: pd.Series = None,
+    option_word: str = "Call",
+) -> dict:
+    """
+    Calculate estimated Greeks and a simple Greek risk grade for one scanner trade.
+
+    This uses Black-Scholes estimates from src/option_greeks.py.
+    Broker Greeks can differ slightly, so these should be used for ranking,
+    filtering, and risk awareness — not as guaranteed pricing values.
+    """
+
+    option_type = str(option_word).lower().strip()
+
+    buy_iv = safe_float(buy_leg.get("impliedVolatility", DEFAULT_IV_FOR_DELTA), DEFAULT_IV_FOR_DELTA)
+
+    if pd.isna(buy_iv) or buy_iv <= 0:
+        buy_iv = DEFAULT_IV_FOR_DELTA
+
+    buy_greeks = estimate_leg_greeks(
+        stock_price=stock_price,
+        strike=safe_float(buy_leg.get("strike", 0), 0),
+        dte=dte,
+        iv=buy_iv,
+        option_type=option_type,
+        side="buy",
+        risk_free_rate=RISK_FREE_RATE,
+    )
+
+    sell_greeks = None
+    sell_iv = np.nan
+
+    if sell_leg is not None:
+        sell_iv = safe_float(sell_leg.get("impliedVolatility", DEFAULT_IV_FOR_DELTA), DEFAULT_IV_FOR_DELTA)
+
+        if pd.isna(sell_iv) or sell_iv <= 0:
+            sell_iv = DEFAULT_IV_FOR_DELTA
+
+        sell_greeks = estimate_leg_greeks(
+            stock_price=stock_price,
+            strike=safe_float(sell_leg.get("strike", 0), 0),
+            dte=dte,
+            iv=sell_iv,
+            option_type=option_type,
+            side="sell",
+            risk_free_rate=RISK_FREE_RATE,
+        )
+
+    net = combine_leg_greeks(
+        buy_leg=buy_greeks,
+        sell_leg=sell_greeks,
+    )
+
+    if sell_leg is not None and not pd.isna(sell_iv):
+        avg_iv = (buy_iv + sell_iv) / 2
+    else:
+        avg_iv = buy_iv
+
+    greek_grade = grade_greek_risk(
+        strategy=strategy,
+        stock_price=stock_price,
+        breakeven=breakeven,
+        net_debit_credit=net_debit_credit,
+        dte=dte,
+        buy_delta=safe_float(buy_leg.get("Delta", 0), 0),
+        sell_delta=0.0 if sell_leg is None else safe_float(sell_leg.get("Delta", 0), 0),
+        net_delta=net["NetDelta"],
+        net_gamma=net["NetGamma"],
+        net_theta=net["NetTheta"],
+        net_vega=net["NetVega"],
+        avg_iv=avg_iv,
+    )
+
+    return {
+        "BuyGamma": round(safe_float(buy_greeks.get("Gamma", 0), 0), 6),
+        "SellGamma": "" if sell_greeks is None else round(safe_float(sell_greeks.get("Gamma", 0), 0), 6),
+        "BuyTheta": round(safe_float(buy_greeks.get("Theta", 0), 0), 6),
+        "SellTheta": "" if sell_greeks is None else round(safe_float(sell_greeks.get("Theta", 0), 0), 6),
+        "BuyVega": round(safe_float(buy_greeks.get("Vega", 0), 0), 6),
+        "SellVega": "" if sell_greeks is None else round(safe_float(sell_greeks.get("Vega", 0), 0), 6),
+        "BuyRho": round(safe_float(buy_greeks.get("Rho", 0), 0), 6),
+        "SellRho": "" if sell_greeks is None else round(safe_float(sell_greeks.get("Rho", 0), 0), 6),
+        "BuyTheoreticalPrice": round(safe_float(buy_greeks.get("TheoreticalPrice", 0), 0), 4),
+        "SellTheoreticalPrice": "" if sell_greeks is None else round(safe_float(sell_greeks.get("TheoreticalPrice", 0), 0), 4),
+        "NetDelta": round(safe_float(net.get("NetDelta", 0), 0), 6),
+        "NetGamma": round(safe_float(net.get("NetGamma", 0), 0), 6),
+        "NetTheta": round(safe_float(net.get("NetTheta", 0), 0), 6),
+        "NetVega": round(safe_float(net.get("NetVega", 0), 0), 6),
+        "NetRho": round(safe_float(net.get("NetRho", 0), 0), 6),
+        "AvgIVForGreeks": round(avg_iv * 100, 2),
+        **greek_grade,
+    }
+
+
 def candidate_pool(
     df: pd.DataFrame,
     min_abs_delta: float,
@@ -694,6 +799,17 @@ def make_long_option_trade(
 
     robinhood_chain_url = f"https://robinhood.com/options/chains/{ticker}"
 
+    greek_fields = calculate_trade_greeks(
+        strategy=strategy,
+        stock_price=stock_price,
+        dte=int(leg["DTE"]),
+        breakeven=breakeven,
+        net_debit_credit=debit,
+        buy_leg=leg,
+        sell_leg=None,
+        option_word=option_word,
+    )
+
     return {
         "Ticker": ticker,
         "RobinhoodChainUrl": robinhood_chain_url,
@@ -736,6 +852,7 @@ def make_long_option_trade(
         "FinalScore": round(final_score, 2),
         "ActionGrade": grade,
         "ActionRank": action_rank(grade),
+        **greek_fields,
         "RobinhoodAction": robinhood_action,
     }
 
@@ -902,6 +1019,17 @@ def make_spread_trade(
 
     robinhood_chain_url = f"https://robinhood.com/options/chains/{ticker}"
 
+    greek_fields = calculate_trade_greeks(
+        strategy=strategy,
+        stock_price=stock_price,
+        dte=int(long_leg["DTE"]),
+        breakeven=breakeven,
+        net_debit_credit=net_price,
+        buy_leg=long_leg,
+        sell_leg=short_leg,
+        option_word=option_word,
+    )
+
     return {
         "Ticker": ticker,
         "RobinhoodChainUrl": robinhood_chain_url,
@@ -941,6 +1069,7 @@ def make_spread_trade(
         "FinalScore": round(final_score, 2),
         "ActionGrade": grade,
         "ActionRank": action_rank(grade),
+        **greek_fields,
         "RobinhoodAction": robinhood_action,
     }
 

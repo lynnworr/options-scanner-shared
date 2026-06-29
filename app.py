@@ -54,6 +54,7 @@ def safe_float(value, default=np.nan):
 def clean_text(value):
     if pd.isna(value):
         return ""
+
     return str(value).strip()
 
 
@@ -106,6 +107,9 @@ def load_options_board():
         "RobinhoodChainUrl",
         "VerifyRule",
         "RobinhoodAction",
+        "GreekRiskGrade",
+        "GreekRiskLevel",
+        "GreekRiskReason",
     ]
 
     for col in text_cols:
@@ -137,6 +141,22 @@ def load_options_board():
         "BuyVolume",
         "SellVolume",
         "AvgBidAskSpreadPct",
+        "BuyGamma",
+        "SellGamma",
+        "BuyTheta",
+        "SellTheta",
+        "BuyVega",
+        "SellVega",
+        "NetDelta",
+        "NetGamma",
+        "NetTheta",
+        "NetVega",
+        "NetRho",
+        "ThetaPctOfPremium",
+        "BreakevenMovePct",
+        "ExpectedMovePct",
+        "BreakevenVsExpectedMove",
+        "GreekRiskScore",
     ]
 
     for col in numeric_cols:
@@ -170,6 +190,8 @@ def manual_verify_priority(row: pd.Series):
 
     quality = clean_text(row.get("QualityFlag", ""))
     strategy = clean_text(row.get("Strategy", ""))
+    greek_grade = clean_text(row.get("GreekRiskGrade", ""))
+    greek_level = clean_text(row.get("GreekRiskLevel", ""))
 
     priority_score = 0
     reasons = []
@@ -226,6 +248,20 @@ def manual_verify_priority(row: pd.Series):
             elif reward_risk >= 0.50:
                 priority_score += 1
                 reasons.append("thin but possible debit spread reward/risk")
+
+    if greek_grade in ["A", "B"]:
+        priority_score += 2
+        reasons.append("good Greek risk profile")
+    elif greek_grade == "C":
+        priority_score += 1
+        reasons.append("usable Greek risk profile")
+    elif greek_grade in ["D", "F"]:
+        priority_score -= 2
+        reasons.append("weak Greek risk profile")
+
+    if greek_level in ["HIGH", "VERY HIGH"]:
+        priority_score -= 2
+        reasons.append("high Greek risk level")
 
     if "Good liquidity" in quality:
         priority_score += 2
@@ -290,6 +326,23 @@ def score_label(score):
     return "Low quality"
 
 
+def greek_grade_label(grade):
+    grade = clean_text(grade)
+
+    if grade == "A":
+        return "A — strong Greek profile"
+    if grade == "B":
+        return "B — tradable Greek profile"
+    if grade == "C":
+        return "C — usable but watch closely"
+    if grade == "D":
+        return "D — weak Greek profile"
+    if grade == "F":
+        return "F — avoid unless specific reason"
+
+    return "No Greek grade"
+
+
 def is_long_option_strategy(series: pd.Series):
     strategy_clean = series.fillna("").astype(str).str.strip()
     return strategy_clean.isin(["Long Call", "Long Put"])
@@ -301,12 +354,12 @@ def is_long_option_strategy(series: pd.Series):
 
 st.title("Options Scanner Board")
 st.caption(
-    "Shared scanner-only dashboard. The scanner finds ideas; Robinhood is used for manual quote verification."
+    "Shared scanner-only dashboard. The scanner finds ideas; Robinhood/Webull is used for manual quote verification."
 )
 
 st.warning(
     "This board does not place trades and does not make final trade decisions. "
-    "Always verify credit/debit, max profit, max loss, breakeven, liquidity, and risk inside Robinhood."
+    "Always verify credit/debit, max profit, max loss, breakeven, liquidity, Greeks, and risk inside your broker."
 )
 
 
@@ -391,16 +444,28 @@ biases = sorted(df["Bias"].dropna().unique().tolist()) if "Bias" in df.columns e
 priorities = sorted(df["ManualVerifyPriority"].dropna().unique().tolist()) if "ManualVerifyPriority" in df.columns else []
 qualities = sorted(df["QualityFlag"].dropna().unique().tolist()) if "QualityFlag" in df.columns else []
 grades = sorted(df["ActionGrade"].dropna().unique().tolist()) if "ActionGrade" in df.columns else []
+greek_grades = sorted(df["GreekRiskGrade"].dropna().unique().tolist()) if "GreekRiskGrade" in df.columns else []
+greek_levels = sorted(df["GreekRiskLevel"].dropna().unique().tolist()) if "GreekRiskLevel" in df.columns else []
 
 selected_tickers = st.sidebar.multiselect("Tickers", tickers)
 selected_strategies = st.sidebar.multiselect("Strategies", strategies)
 selected_biases = st.sidebar.multiselect("Bias", biases)
 selected_priorities = st.sidebar.multiselect("Manual Verify Priority", priorities)
+selected_greek_grades = st.sidebar.multiselect("Greek Risk Grade", greek_grades)
+selected_greek_levels = st.sidebar.multiselect("Greek Risk Level", greek_levels)
 selected_qualities = st.sidebar.multiselect("Quote Quality", qualities)
 selected_grades = st.sidebar.multiselect("Action Grade", grades)
 
 min_score = st.sidebar.slider(
     "Minimum Scanner Score",
+    min_value=0.0,
+    max_value=100.0,
+    value=0.0,
+    step=1.0,
+)
+
+min_greek_score = st.sidebar.slider(
+    "Minimum Greek Risk Score",
     min_value=0.0,
     max_value=100.0,
     value=0.0,
@@ -427,6 +492,22 @@ min_reward_risk = st.sidebar.slider(
     step=0.05,
 )
 
+max_theta_pct = st.sidebar.slider(
+    "Max Theta % of Premium",
+    min_value=0.0,
+    max_value=50.0,
+    value=50.0,
+    step=1.0,
+)
+
+max_breakeven_vs_expected = st.sidebar.slider(
+    "Max Breakeven vs Expected Move",
+    min_value=0.0,
+    max_value=5.0,
+    value=5.0,
+    step=0.1,
+)
+
 filtered = df.copy()
 
 if "Strategy" in filtered.columns:
@@ -450,6 +531,12 @@ if selected_biases:
 if selected_priorities:
     filtered = filtered[filtered["ManualVerifyPriority"].isin(selected_priorities)]
 
+if selected_greek_grades and "GreekRiskGrade" in filtered.columns:
+    filtered = filtered[filtered["GreekRiskGrade"].isin(selected_greek_grades)]
+
+if selected_greek_levels and "GreekRiskLevel" in filtered.columns:
+    filtered = filtered[filtered["GreekRiskLevel"].isin(selected_greek_levels)]
+
 if selected_qualities:
     filtered = filtered[filtered["QualityFlag"].isin(selected_qualities)]
 
@@ -459,8 +546,19 @@ if selected_grades:
 if "FinalScore" in filtered.columns:
     filtered = filtered[filtered["FinalScore"] >= min_score]
 
+if "GreekRiskScore" in filtered.columns:
+    filtered = filtered[filtered["GreekRiskScore"] >= min_greek_score]
+
 if "DTE" in filtered.columns:
     filtered = filtered[filtered["DTE"] <= max_dte]
+
+if "ThetaPctOfPremium" in filtered.columns:
+    theta_numeric = pd.to_numeric(filtered["ThetaPctOfPremium"], errors="coerce")
+    filtered = filtered[theta_numeric.isna() | (theta_numeric <= max_theta_pct)]
+
+if "BreakevenVsExpectedMove" in filtered.columns:
+    be_expected_numeric = pd.to_numeric(filtered["BreakevenVsExpectedMove"], errors="coerce")
+    filtered = filtered[be_expected_numeric.isna() | (be_expected_numeric <= max_breakeven_vs_expected)]
 
 if "RewardRisk" in filtered.columns and "Strategy" in filtered.columns:
     long_mask = is_long_option_strategy(filtered["Strategy"])
@@ -476,15 +574,24 @@ if "RewardRisk" in filtered.columns and "Strategy" in filtered.columns:
         | (reward_risk_numeric >= min_reward_risk)
     ]
 
-if not filtered.empty:
+sort_cols = []
+ascending = []
+
+for col, asc in [
+    ("ManualVerifyScore", False),
+    ("GreekRiskScore", False),
+    ("DTE", True),
+    ("FinalScore", False),
+    ("StockSetupScore", False),
+]:
+    if col in filtered.columns:
+        sort_cols.append(col)
+        ascending.append(asc)
+
+if not filtered.empty and sort_cols:
     filtered = filtered.sort_values(
-        by=[
-            "ManualVerifyScore",
-            "DTE",
-            "FinalScore",
-            "StockSetupScore",
-        ],
-        ascending=[False, True, False, False],
+        by=sort_cols,
+        ascending=ascending,
     )
 
 
@@ -492,7 +599,7 @@ if not filtered.empty:
 # Metrics
 # ============================================================
 
-m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 
 with m1:
     st.metric("Trades", len(filtered))
@@ -523,10 +630,18 @@ with m5:
     st.metric("Verify First", verify_first_count)
 
 with m6:
+    if not filtered.empty and "GreekRiskGrade" in filtered.columns:
+        ab_count = int(filtered["GreekRiskGrade"].isin(["A", "B"]).sum())
+    else:
+        ab_count = 0
+
+    st.metric("Greek A/B", ab_count)
+
+with m7:
     short_dte_count = int((filtered["DTE"] <= 7).sum()) if "DTE" in filtered.columns and not filtered.empty else 0
     st.metric("≤ 7 DTE", short_dte_count)
 
-with m7:
+with m8:
     top_score = filtered["FinalScore"].max() if "FinalScore" in filtered.columns and not filtered.empty else 0
     st.metric("Top Score", f"{top_score:.1f}")
 
@@ -543,6 +658,10 @@ display_cols = [
     "ManualVerifyPriority",
     "ManualVerifyScore",
     "ManualVerifyReason",
+    "GreekRiskGrade",
+    "GreekRiskScore",
+    "GreekRiskLevel",
+    "GreekRiskReason",
     "Bias",
     "Strategy",
     "Expiration",
@@ -557,6 +676,18 @@ display_cols = [
     "MaxLoss",
     "Breakeven",
     "RewardRisk",
+    "NetDelta",
+    "NetGamma",
+    "NetTheta",
+    "NetVega",
+    "ThetaPctOfPremium",
+    "BreakevenMovePct",
+    "ExpectedMovePct",
+    "BreakevenVsExpectedMove",
+    "BuyDelta",
+    "SellDelta",
+    "BuyIV",
+    "SellIV",
     "QualityFlag",
     "FinalScore",
     "ActionGrade",
@@ -583,7 +714,20 @@ st.dataframe(
         "MaxLoss": st.column_config.NumberColumn("Scanner Max Loss", format="$%.2f"),
         "Breakeven": st.column_config.NumberColumn("Scanner Breakeven", format="$%.2f"),
         "RewardRisk": st.column_config.NumberColumn("Reward/Risk", format="%.2f"),
-        "FinalScore": st.column_config.NumberColumn("Score", format="%.2f"),
+        "FinalScore": st.column_config.NumberColumn("Scanner Score", format="%.2f"),
+        "GreekRiskScore": st.column_config.NumberColumn("Greek Score", format="%.2f"),
+        "NetDelta": st.column_config.NumberColumn("Net Delta", format="%.4f"),
+        "NetGamma": st.column_config.NumberColumn("Net Gamma", format="%.4f"),
+        "NetTheta": st.column_config.NumberColumn("Net Theta", format="%.4f"),
+        "NetVega": st.column_config.NumberColumn("Net Vega", format="%.4f"),
+        "ThetaPctOfPremium": st.column_config.NumberColumn("Theta % Premium", format="%.2f"),
+        "BreakevenMovePct": st.column_config.NumberColumn("BE Move %", format="%.2f"),
+        "ExpectedMovePct": st.column_config.NumberColumn("Expected Move %", format="%.2f"),
+        "BreakevenVsExpectedMove": st.column_config.NumberColumn("BE / Exp Move", format="%.2f"),
+        "BuyDelta": st.column_config.NumberColumn("Buy Delta", format="%.2f"),
+        "SellDelta": st.column_config.NumberColumn("Sell Delta", format="%.2f"),
+        "BuyIV": st.column_config.NumberColumn("Buy IV %", format="%.2f"),
+        "SellIV": st.column_config.NumberColumn("Sell IV %", format="%.2f"),
     },
 )
 
@@ -603,6 +747,8 @@ else:
         detail_df["Ticker"].astype(str)
         + " | "
         + detail_df["ManualVerifyPriority"].astype(str)
+        + " | Greeks "
+        + detail_df.get("GreekRiskGrade", pd.Series([""] * len(detail_df))).astype(str)
         + " | "
         + detail_df["Strategy"].astype(str)
         + " | "
@@ -614,13 +760,13 @@ else:
     )
 
     selected_label = st.selectbox(
-        "Select a trade to discuss/check in Robinhood",
+        "Select a trade to discuss/check in Webull or Robinhood",
         detail_df["TradeLabel"].tolist(),
     )
 
     selected = detail_df[detail_df["TradeLabel"] == selected_label].iloc[0]
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
         st.markdown("### Setup")
@@ -637,7 +783,7 @@ else:
         st.markdown("### Scanner Estimate")
         st.write(f"**Type:** {selected.get('DebitOrCredit', '')}")
         st.write(f"**Scanner Credit/Debit:** ${safe_float(selected.get('NetDebitCredit', 0), 0):.2f}")
-        st.write(f"**Minimum Robinhood Price:** ${safe_float(selected.get('MinimumRobinhoodPrice', 0), 0):.2f}")
+        st.write(f"**Minimum Broker Price:** ${safe_float(selected.get('MinimumRobinhoodPrice', 0), 0):.2f}")
 
         spread_width = safe_float(selected.get("SpreadWidth", np.nan), np.nan)
 
@@ -664,6 +810,20 @@ else:
             st.write("**Reward/Risk:** N/A for long option")
 
     with c3:
+        st.markdown("### Greeks")
+        st.write(f"**Greek Grade:** {greek_grade_label(selected.get('GreekRiskGrade', ''))}")
+        st.write(f"**Greek Score:** {safe_float(selected.get('GreekRiskScore', 0), 0):.2f}")
+        st.write(f"**Greek Risk Level:** {selected.get('GreekRiskLevel', '')}")
+        st.write(f"**Net Delta:** {safe_float(selected.get('NetDelta', 0), 0):.4f}")
+        st.write(f"**Net Gamma:** {safe_float(selected.get('NetGamma', 0), 0):.4f}")
+        st.write(f"**Net Theta:** {safe_float(selected.get('NetTheta', 0), 0):.4f}")
+        st.write(f"**Net Vega:** {safe_float(selected.get('NetVega', 0), 0):.4f}")
+        st.write(f"**Theta % of Premium:** {safe_float(selected.get('ThetaPctOfPremium', 0), 0):.2f}%")
+        st.write(f"**Breakeven Move:** {safe_float(selected.get('BreakevenMovePct', 0), 0):.2f}%")
+        st.write(f"**Expected Move:** {safe_float(selected.get('ExpectedMovePct', 0), 0):.2f}%")
+        st.write(f"**BE / Expected Move:** {safe_float(selected.get('BreakevenVsExpectedMove', 0), 0):.2f}")
+
+    with c4:
         st.markdown("### Priority / Score")
         final_score = safe_float(selected.get("FinalScore", 0), 0)
         st.write(f"**Manual Priority:** {selected.get('ManualVerifyPriority', '')}")
@@ -680,19 +840,29 @@ else:
                 use_container_width=True,
             )
 
-    st.markdown("### How to verify in Robinhood")
+    st.markdown("### Greek Risk Reason")
+    st.info(selected.get("GreekRiskReason", "No Greek risk reason available."))
+
+    st.markdown("### How to verify in Webull / Robinhood")
     st.write(
-        "Open the chain, choose the same expiration, use Builder if needed, add the exact option leg or spread legs, "
-        "then compare Robinhood's credit/debit, max profit, max loss, breakeven, and liquidity to the scanner estimate."
+        "Open the same ticker, choose the same expiration, add the exact option leg or spread legs, "
+        "then compare the broker's credit/debit, max profit, max loss, breakeven, liquidity, Greeks, and risk to the scanner estimate."
+    )
+
+    st.markdown("### Practical paper-trading rule")
+    st.write(
+        "For the first paper test, prefer trades with **Scanner Score 45+**, **Greek Grade A or B**, "
+        "**Manual Priority VERIFY FIRST or VERIFY**, and **DTE between 2 and 7** for long options."
     )
 
     st.markdown("### Score guide")
     st.write(
-        "**70+** = strong scanner setup. "
+        "**Scanner Score 70+** = strong setup. "
         "**55–70** = good candidate. "
         "**40–55** = usable but verify carefully. "
-        "**30–40** = weak / idea only. "
-        "**Below 30** = usually skip."
+        "**Below 40** = usually skip. "
+        "**Greek Grade A/B** = preferred risk profile. "
+        "**Greek Grade D/F** = avoid unless there is a very specific reason."
     )
 
 
